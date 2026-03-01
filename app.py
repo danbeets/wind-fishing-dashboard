@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 
 import re
-from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
 
-import pandas as pd
 import requests
 import streamlit as st
 
@@ -20,13 +17,14 @@ PRESETS = {
 }
 
 DEFAULT_PRESET_NAME = "Owyhee (near reservoir), NV"
-DEFAULT_USER_AGENT = "OwyheeWindPicker (contact@example.com)"
+DEFAULT_USER_AGENT = "FlyfishingWeatherPlanner (contact@example.com)"
 
 # ----------------------------
 # Threshold logic (uncertainty-aware)
 # ----------------------------
 
 def tighten_margin(days_out: int) -> int:
+    """How many mph to subtract from thresholds as forecast gets farther out."""
     if days_out <= 2:
         return 0
     if days_out <= 4:
@@ -43,26 +41,23 @@ def effective_thresholds(
     min_good: int,
     min_border: int,
 ) -> Tuple[int, int]:
+    """Return (good_max, border_max) for a given days_out."""
     m = tighten_margin(days_out)
     good_max = max(min_good, good_base - m)
     border_max = max(min_border, border_base - m)
     border_max = max(border_max, good_max)
     return good_max, border_max
 
-
 # ----------------------------
 # Helpers
 # ----------------------------
 
-def pretty_date(day_iso: str) -> str:
-    dt = datetime.fromisoformat(day_iso)
-    try:
-        return dt.strftime("%A, %B %-d")
-    except ValueError:
-        return dt.strftime("%A, %B %#d")
-
-
 def wind_to_mph(wind_str: str) -> Optional[int]:
+    """
+    Convert NWS wind strings like:
+      '5 to 10 mph', '10 mph', 'Around 15 mph'
+    into a representative mph number (midpoint if range).
+    """
     if not wind_str:
         return None
     s = wind_str.lower()
@@ -75,6 +70,7 @@ def wind_to_mph(wind_str: str) -> Optional[int]:
 
 
 def parse_nws_time(start_time: str) -> datetime:
+    """Parse NWS ISO time (often includes timezone offset)."""
     return datetime.fromisoformat(start_time.replace("Z", "+00:00"))
 
 
@@ -86,10 +82,33 @@ def local_date_key(start_time: str) -> str:
     return parse_nws_time(start_time).date().isoformat()
 
 
+def pretty_date(day_iso: str) -> str:
+    """Convert YYYY-MM-DD into 'Tuesday, March 3' with cross-platform day formatting."""
+    dt = datetime.fromisoformat(day_iso)
+    try:
+        return dt.strftime("%A, %B %-d")
+    except ValueError:
+        return dt.strftime("%A, %B %#d")
+
+
 def days_out_from_date(day_iso: str) -> int:
+    """Days between local 'today' and day_iso."""
     today = datetime.now().astimezone().date()
     day_date = datetime.fromisoformat(day_iso).date()
     return (day_date - today).days
+
+
+def hour_label_12h(h: int) -> str:
+    """0->12a, 12->12p, 13->1p, etc."""
+    suffix = "a" if h < 12 else "p"
+    hour12 = 12 if h % 12 == 0 else h % 12
+    return f"{hour12}{suffix}"
+
+
+def should_show_hour_label(h: int, start_h: int, end_h: int) -> bool:
+    """Show only anchor labels to reduce clutter."""
+    anchors = {start_h, end_h, 11, 13, 15, 17}  # start, end, noon, 3p, 6p
+    return h in anchors and start_h <= h <= end_h
 
 
 # ----------------------------
@@ -111,32 +130,14 @@ def hour_tag(
 
     good_max, border_max = effective_thresholds(days_out, good_base, border_base, min_good, min_border)
 
+    # Base on sustained/avg wind, then apply gust downgrade (good -> borderline)
     if wind_mph <= good_max:
         if gust_mph is not None and gust_mph >= gust_downgrade_at:
             return "borderline"
         return "good"
-
     if wind_mph <= border_max:
         return "borderline"
-
     return "bad"
-
-
-# ----------------------------
-# Data classes (kept for future expansion)
-# ----------------------------
-
-@dataclass
-class DaySummary:
-    day: str
-    days_out: int
-    good_max: int
-    border_max: int
-    good_hours: int
-    border_hours: int
-    bad_hours: int
-    best_good_stretch: int
-    qualifies: bool
 
 
 # ----------------------------
@@ -146,6 +147,7 @@ class DaySummary:
 @st.cache_data(ttl=15 * 60)
 def fetch_hourly_periods(lat: float, lon: float, user_agent: str) -> List[dict]:
     headers = {"User-Agent": user_agent}
+
     point_url = f"https://api.weather.gov/points/{lat},{lon}"
     r = requests.get(point_url, headers=headers, timeout=30)
     r.raise_for_status()
@@ -169,14 +171,12 @@ def build_day_hour_tags(
     min_good: int,
     min_border: int,
     gust_downgrade_at: int,
-):
+) -> Dict[str, Dict[int, str]]:
     """
     Returns:
       day_hours: day_iso -> hour -> tag (good/borderline/bad/unknown)
-      day_meta:  day_iso -> (days_out, good_max, border_max)
     """
     day_hours: Dict[str, Dict[int, str]] = {}
-    day_meta: Dict[str, Tuple[int, int, int]] = {}
 
     for p in periods:
         start = p.get("startTime")
@@ -190,34 +190,31 @@ def build_day_hour_tags(
         day_iso = local_date_key(start)
         days_out = days_out_from_date(day_iso)
 
-        good_max, border_max = effective_thresholds(days_out, good_base, border_base, min_good, min_border)
-
         wind = wind_to_mph(p.get("windSpeed", ""))
         gust = wind_to_mph(p.get("windGust", "")) if p.get("windGust") else None
 
         tag = hour_tag(
-            wind,
-            gust,
-            days_out,
-            good_base,
-            border_base,
-            min_good,
-            min_border,
-            gust_downgrade_at,
+            wind_mph=wind,
+            gust_mph=gust,
+            days_out=days_out,
+            good_base=good_base,
+            border_base=border_base,
+            min_good=min_good,
+            min_border=min_border,
+            gust_downgrade_at=gust_downgrade_at,
         )
 
         day_hours.setdefault(day_iso, {})[hr] = tag
-        day_meta[day_iso] = (days_out, good_max, border_max)
 
-    # Ensure each day has every hour in the window (fill missing as unknown)
+    # Fill missing hours as unknown so every row has the same number of blocks
     for day_iso in list(day_hours.keys()):
         for hr in range(day_start_hour, day_end_hour + 1):
             day_hours[day_iso].setdefault(hr, "unknown")
 
-    return day_hours, day_meta
+    return day_hours
 
 
-def render_color_key():
+def render_color_key() -> None:
     st.markdown(
         """
         <style>
@@ -262,7 +259,14 @@ def render_color_key():
     )
 
 
-def render_timeline_strips(day_hours, day_meta, day_start_hour, day_end_hour):
+def render_timeline_strips(
+    day_hours: Dict[str, Dict[int, str]],
+    day_start_hour: int,
+    day_end_hour: int,
+) -> None:
+    """
+    Render each day as a row of touching rectangles (no gaps).
+    """
     colors = {
         "good": "#2ecc71",
         "borderline": "#f1c40f",
@@ -273,42 +277,64 @@ def render_timeline_strips(day_hours, day_meta, day_start_hour, day_end_hour):
     st.markdown(
         """
         <style>
-          .ow-row { display:flex; align-items:center; margin:6px 0; }
-          .ow-label { width:260px; font-size:14px; line-height:1.1; }
-          .ow-strip { display:flex; height:20px; border-radius:6px; overflow:hidden;
-                      border:1px solid rgba(0,0,0,0.08); }
-          .ow-cell { width:22px; height:20px; }
-          .ow-head { display:flex; align-items:center; margin:10px 0 6px 0; }
-          .ow-head-spacer { width:260px; }
+          .ow-row { display: flex; align-items: center; margin: 6px 0; }
+          .ow-label { width: 240px; font-size: 14px; line-height: 1.15; }
+          .ow-strip { display: flex; height: 20px; border-radius: 6px; overflow: hidden;
+                      border: 1px solid rgba(0,0,0,0.08); }
+          .ow-cell { width: 22px; height: 20px; margin: 0; padding: 0; }
+          .ow-head { display:flex; align-items:center; margin: 10px 0 6px 0; }
+          .ow-head-spacer { width: 240px; }
           .ow-hours { display:flex; }
-          .ow-hour { width:22px; font-size:10px; text-align:center; color:#666; }
+          .ow-hour { width: 22px; font-size: 10px; text-align:center; color: #666; font-weight: 600; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    hours_html = "".join([f"<div class='ow-hour'>{h}</div>" for h in range(day_start_hour, day_end_hour + 1)])
+    # Label + less-dense 12h header
+    st.markdown(
+        """
+        <div class="ow-head">
+            <div class="ow-head-spacer"></div>
+            <div class="ow-hours" style="justify-content:center; font-weight:600;">
+                Fishing Hours (Local Time)
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    hours_html_parts = []
+    for h in range(day_start_hour, day_end_hour + 1):
+        if should_show_hour_label(h, day_start_hour, day_end_hour):
+            txt = hour_label_12h(h)
+        else:
+            txt = "&nbsp;"
+        hours_html_parts.append(f"<div class='ow-hour'>{txt}</div>")
+
+    hours_html = "".join(hours_html_parts)
+
     st.markdown(
         f"<div class='ow-head'><div class='ow-head-spacer'></div><div class='ow-hours'>{hours_html}</div></div>",
         unsafe_allow_html=True,
     )
 
     for day_iso in sorted(day_hours.keys()):
-        days_out, good_max, border_max = day_meta.get(day_iso, (None, None, None))
-        label = (
-            f"{pretty_date(day_iso)}<br>"
-  #          f"<span style='color:#666;font-size:12px'>D+{days_out} | good≤{good_max} border≤{border_max}</span>"
-        )
+        label_html = pretty_date(day_iso)
 
         cells = []
         for hr in range(day_start_hour, day_end_hour + 1):
             tag = day_hours[day_iso].get(hr, "unknown")
             color = colors.get(tag, colors["unknown"])
-            cells.append(f"<div class='ow-cell' title='{hr}:00 — {tag}' style='background:{color}'></div>")
+            cells.append(f"<div class='ow-cell' title='{hour_label_12h(hr)} — {tag}' style='background:{color}'></div>")
+
+        strip_html = "".join(cells)
 
         st.markdown(
-            f"<div class='ow-row'><div class='ow-label'>{label}</div>"
-            f"<div class='ow-strip'>{''.join(cells)}</div></div>",
+            f"<div class='ow-row'>"
+            f"  <div class='ow-label'>{label_html}</div>"
+            f"  <div class='ow-strip'>{strip_html}</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
 
@@ -328,29 +354,20 @@ with st.sidebar:
         options=list(PRESETS.keys()),
         index=list(PRESETS.keys()).index(DEFAULT_PRESET_NAME),
     )
-
     lat, lon = PRESETS[preset_name]
+    user_agent = DEFAULT_USER_AGENT  # internal; not user-editable
 
-    # Keep User-Agent internal (not user editable)
-    user_agent = DEFAULT_USER_AGENT
+    st.header("Fishing window")
+    day_start = st.slider("Start time", 0, 23, 9)
+    day_end = st.slider("End time", 0, 23, 19)
 
-    # If preset changes, these update automatically (because values depend on preset_*)
-#    lat = st.number_input("Latitude", value=float(preset_lat), format="%.5f")
-#    lon = st.number_input("Longitude", value=float(preset_lon), format="%.5f")
-
-#    user_agent = st.text_input("User-Agent", value=DEFAULT_USER_AGENT)
-
-    st.header("Fishing window (local)")
-    day_start = st.slider("Start hour", 0, 23, 9)
-    day_end = st.slider("End hour", 0, 23, 19)
-
-    st.header("Wind thresholds (near-term)")
-    good_base = st.slider("Good conditions if wind less than (mph)", 1, 25, 10)
-    border_base = st.slider("Borderline wind conditions if more than (mph)", 1, 30, 14)
-    gust_downgrade_at = st.slider("Red if gusts more than (mph)", 10, 50, 20)
+    st.header("Wind thresholds (sustained wind)")
+    good_base = st.slider("Good max wind (mph)", 1, 25, 10)
+    border_base = st.slider("Borderline max wind (mph)", 1, 30, 14)
+    gust_downgrade_at = st.slider("Downgrade if gust ≥ (mph)", 10, 50, 20)
 
 if day_end < day_start:
-    st.error("End hour must be >= start hour.")
+    st.error("End time must be >= start time.")
     st.stop()
 
 # Fetch
@@ -360,22 +377,21 @@ except Exception as e:
     st.error(f"Failed to fetch NWS data: {e}")
     st.stop()
 
-# Timeline
-st.subheader(f"Fishing window timeline — {preset_name}")
+st.subheader(f"Timeline — {preset_name}")
 render_color_key()
 
-day_hours, day_meta = build_day_hour_tags(
-    periods,
-    day_start,
-    day_end,
-    good_base,
-    border_base,
-    6,   # min_good (floor)
-    10,  # min_border (floor)
-    gust_downgrade_at,
+day_hours = build_day_hour_tags(
+    periods=periods,
+    day_start_hour=day_start,
+    day_end_hour=day_end,
+    good_base=good_base,
+    border_base=border_base,
+    min_good=6,
+    min_border=10,
+    gust_downgrade_at=gust_downgrade_at,
 )
 
 if not day_hours:
     st.write("No hourly data fell within the selected fishing window.")
 else:
-    render_timeline_strips(day_hours, day_meta, day_start, day_end)
+    render_timeline_strips(day_hours, day_start, day_end)
