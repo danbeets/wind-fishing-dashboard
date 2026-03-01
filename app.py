@@ -217,25 +217,45 @@ def build_day_hour_tags(
     return day_hours, day_meta
 
 
-def render_color_key(gust_downgrade_at: int):
+def render_color_key():
     st.markdown(
         """
         <style>
-          .ow-key { display:flex; gap:16px; margin: 6px 0 12px 0; flex-wrap: wrap; }
+          .ow-key { display:flex; gap:18px; margin: 6px 0 6px 0; flex-wrap: wrap; }
           .ow-key-item { display:flex; align-items:center; gap:6px; font-size:13px; }
           .ow-swatch { width:14px; height:14px; border-radius:3px; border:1px solid rgba(0,0,0,0.2); }
+          .ow-key-note { font-size:12px; color:#666; margin-top:4px; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        f"""
+        """
         <div class="ow-key">
-          <div class="ow-key-item"><div class="ow-swatch" style="background:#2ecc71"></div>Good (≤ threshold, gust &lt; {gust_downgrade_at})</div>
-          <div class="ow-key-item"><div class="ow-swatch" style="background:#f1c40f"></div>Borderline</div>
-          <div class="ow-key-item"><div class="ow-swatch" style="background:#e74c3c"></div>Bad (too windy)</div>
-          <div class="ow-key-item"><div class="ow-swatch" style="background:#95a5a6"></div>Unknown</div>
+          <div class="ow-key-item">
+            <div class="ow-swatch" style="background:#2ecc71"></div>
+            <strong>Good</strong> – Comfortable float-tube conditions.
+          </div>
+
+          <div class="ow-key-item">
+            <div class="ow-swatch" style="background:#f1c40f"></div>
+            <strong>Borderline</strong> – Fishable but windy or gusty.
+          </div>
+
+          <div class="ow-key-item">
+            <div class="ow-swatch" style="background:#e74c3c"></div>
+            <strong>Bad</strong> – Likely too windy.
+          </div>
+
+          <div class="ow-key-item">
+            <div class="ow-swatch" style="background:#95a5a6"></div>
+            <strong>Unknown</strong> – No data available.
+          </div>
+        </div>
+
+        <div class="ow-key-note">
+          Thresholds tighten slightly for days farther out to reflect forecast uncertainty.
         </div>
         """,
         unsafe_allow_html=True,
@@ -277,7 +297,7 @@ def render_timeline_strips(day_hours, day_meta, day_start_hour, day_end_hour):
         days_out, good_max, border_max = day_meta.get(day_iso, (None, None, None))
         label = (
             f"{pretty_date(day_iso)}<br>"
-            f"<span style='color:#666;font-size:12px'>D+{days_out} | good≤{good_max} border≤{border_max}</span>"
+  #          f"<span style='color:#666;font-size:12px'>D+{days_out} | good≤{good_max} border≤{border_max}</span>"
         )
 
         cells = []
@@ -297,33 +317,37 @@ def render_timeline_strips(day_hours, day_meta, day_start_hour, day_end_hour):
 # Streamlit UI
 # ----------------------------
 
-st.set_page_config(page_title="Wind Fishing Planner", layout="wide")
-st.title("Wind Fishing Planner")
+st.set_page_config(page_title="Flyfishing Weather Planner", layout="wide")
+st.title("Flyfishing Weather Planner")
 
 with st.sidebar:
     st.header("Location")
 
     preset_name = st.selectbox(
-        "Preset",
+        "Select fishing location",
         options=list(PRESETS.keys()),
         index=list(PRESETS.keys()).index(DEFAULT_PRESET_NAME),
     )
-    preset_lat, preset_lon = PRESETS[preset_name]
+
+    lat, lon = PRESETS[preset_name]
+
+    # Keep User-Agent internal (not user editable)
+    user_agent = DEFAULT_USER_AGENT
 
     # If preset changes, these update automatically (because values depend on preset_*)
-    lat = st.number_input("Latitude", value=float(preset_lat), format="%.5f")
-    lon = st.number_input("Longitude", value=float(preset_lon), format="%.5f")
+#    lat = st.number_input("Latitude", value=float(preset_lat), format="%.5f")
+#    lon = st.number_input("Longitude", value=float(preset_lon), format="%.5f")
 
-    user_agent = st.text_input("User-Agent", value=DEFAULT_USER_AGENT)
+#    user_agent = st.text_input("User-Agent", value=DEFAULT_USER_AGENT)
 
     st.header("Fishing window (local)")
     day_start = st.slider("Start hour", 0, 23, 9)
     day_end = st.slider("End hour", 0, 23, 19)
 
     st.header("Wind thresholds (near-term)")
-    good_base = st.slider("GOOD max mph", 1, 25, 10)
-    border_base = st.slider("BORDER max mph", 1, 30, 14)
-    gust_downgrade_at = st.slider("Downgrade if gust ≥", 10, 50, 20)
+    good_base = st.slider("Good conditions if wind less than (mph)", 1, 25, 10)
+    border_base = st.slider("Borderline wind conditions if more than (mph)", 1, 30, 14)
+    gust_downgrade_at = st.slider("Red if gusts more than (mph)", 10, 50, 20)
 
 if day_end < day_start:
     st.error("End hour must be >= start hour.")
@@ -338,7 +362,7 @@ except Exception as e:
 
 # Timeline
 st.subheader(f"Fishing window timeline — {preset_name}")
-render_color_key(gust_downgrade_at)
+render_color_key()
 
 day_hours, day_meta = build_day_hour_tags(
     periods,
