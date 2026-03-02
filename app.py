@@ -8,21 +8,37 @@ import requests
 import streamlit as st
 
 # ----------------------------
-# Location presets
+# Location presets (type-aware)
 # ----------------------------
 PRESETS = {
-    "Owyhee (near reservoir), NV": (41.95, -116.92),
-    "Henry's Lake, ID": (44.60, -111.36),
-    "Whitebird, ID": (45.75, -116.33),
+    "Owyhee (near reservoir), NV": {
+        "lat": 41.95,
+        "lon": -116.92,
+        "type": "lake",
+    },
+    "Henry's Lake (Island Park), ID": {
+        "lat": 44.60,
+        "lon": -111.36,
+        "type": "lake",
+    },
+    "Whitebird / Hammer Creek (Salmon River), ID": {
+        "lat": 45.75,
+        "lon": -116.33,
+        "type": "river",
+        # USGS gage commonly used for this area:
+        # Salmon River at White Bird, ID
+        "usgs_site": "13317000",
+        "usgs_name": "Salmon River at White Bird (USGS 13317000)",
+    },
 }
 
 DEFAULT_PRESET_NAME = "Owyhee (near reservoir), NV"
 DEFAULT_USER_AGENT = "FlyfishingWeatherPlanner (contact@example.com)"
 
+
 # ----------------------------
 # Threshold logic (uncertainty-aware)
 # ----------------------------
-
 def tighten_margin(days_out: int) -> int:
     """How many mph to subtract from thresholds as forecast gets farther out."""
     if days_out <= 2:
@@ -48,10 +64,10 @@ def effective_thresholds(
     border_max = max(border_max, good_max)
     return good_max, border_max
 
+
 # ----------------------------
 # Helpers
 # ----------------------------
-
 def wind_to_mph(wind_str: str) -> Optional[int]:
     """
     Convert NWS wind strings like:
@@ -107,14 +123,13 @@ def hour_label_12h(h: int) -> str:
 
 def should_show_hour_label(h: int, start_h: int, end_h: int) -> bool:
     """Show only anchor labels to reduce clutter."""
-    anchors = {start_h, end_h, 11, 13, 15, 17}  # start, end, noon, 3p, 6p
+    anchors = {start_h, end_h, 12, 15, 18}  # start, end, noon, 3p, 6p
     return h in anchors and start_h <= h <= end_h
 
 
 # ----------------------------
 # Classification
 # ----------------------------
-
 def hour_tag(
     wind_mph: Optional[int],
     gust_mph: Optional[int],
@@ -143,9 +158,8 @@ def hour_tag(
 # ----------------------------
 # NWS Fetch
 # ----------------------------
-
 @st.cache_data(ttl=15 * 60)
-def fetch_hourly_periods(lat: float, lon: float, user_agent: str) -> List[dict]:
+def fetch_nws_hourly_periods(lat: float, lon: float, user_agent: str) -> List[dict]:
     headers = {"User-Agent": user_agent}
 
     point_url = f"https://api.weather.gov/points/{lat},{lon}"
@@ -159,9 +173,42 @@ def fetch_hourly_periods(lat: float, lon: float, user_agent: str) -> List[dict]:
 
 
 # ----------------------------
+# USGS Fetch (river flow)
+# ----------------------------
+@st.cache_data(ttl=10 * 60)
+def usgs_latest_discharge_cfs(site_no: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Returns (cfs, iso_datetime) for the most recent discharge reading, or (None, None).
+    Uses USGS NWIS Instantaneous Values service with parameterCd=00060 (discharge in cfs).
+    """
+    url = "https://waterservices.usgs.gov/nwis/iv/"
+    params = {
+        "format": "json",
+        "sites": site_no,
+        "parameterCd": "00060",  # discharge (cfs)
+    }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+
+    series = j.get("value", {}).get("timeSeries", [])
+    if not series:
+        return None, None
+
+    values = series[0].get("values", [])
+    if not values or not values[0].get("value"):
+        return None, None
+
+    latest = values[0]["value"][-1]
+    try:
+        return float(latest["value"]), latest.get("dateTime")
+    except Exception:
+        return None, None
+
+
+# ----------------------------
 # Timeline helpers
 # ----------------------------
-
 def build_day_hour_tags(
     periods: List[dict],
     day_start_hour: int,
@@ -259,14 +306,8 @@ def render_color_key() -> None:
     )
 
 
-def render_timeline_strips(
-    day_hours: Dict[str, Dict[int, str]],
-    day_start_hour: int,
-    day_end_hour: int,
-) -> None:
-    """
-    Render each day as a row of touching rectangles (no gaps).
-    """
+def render_timeline_strips(day_hours: Dict[str, Dict[int, str]], day_start_hour: int, day_end_hour: int) -> None:
+    """Render each day as a row of touching rectangles (no gaps)."""
     colors = {
         "good": "#2ecc71",
         "borderline": "#f1c40f",
@@ -291,12 +332,12 @@ def render_timeline_strips(
         unsafe_allow_html=True,
     )
 
-    # Label + less-dense 12h header
+    # Centered label over the hours strip (not the whole page)
     st.markdown(
         """
         <div class="ow-head">
             <div class="ow-head-spacer"></div>
-            <div class="ow-hours" style="justify-content:center; font-weight:600;">
+            <div class="ow-hours" style="justify-content:center; font-weight:600; font-size:14px; color:#444;">
                 Fishing Hours (Local Time)
             </div>
         </div>
@@ -304,12 +345,10 @@ def render_timeline_strips(
         unsafe_allow_html=True,
     )
 
+    # Less-dense 12h header row
     hours_html_parts = []
     for h in range(day_start_hour, day_end_hour + 1):
-        if should_show_hour_label(h, day_start_hour, day_end_hour):
-            txt = hour_label_12h(h)
-        else:
-            txt = "&nbsp;"
+        txt = hour_label_12h(h) if should_show_hour_label(h, day_start_hour, day_end_hour) else "&nbsp;"
         hours_html_parts.append(f"<div class='ow-hour'>{txt}</div>")
 
     hours_html = "".join(hours_html_parts)
@@ -326,14 +365,14 @@ def render_timeline_strips(
         for hr in range(day_start_hour, day_end_hour + 1):
             tag = day_hours[day_iso].get(hr, "unknown")
             color = colors.get(tag, colors["unknown"])
-            cells.append(f"<div class='ow-cell' title='{hour_label_12h(hr)} — {tag}' style='background:{color}'></div>")
-
-        strip_html = "".join(cells)
+            cells.append(
+                f"<div class='ow-cell' title='{hour_label_12h(hr)} — {tag}' style='background:{color}'></div>"
+            )
 
         st.markdown(
             f"<div class='ow-row'>"
             f"  <div class='ow-label'>{label_html}</div>"
-            f"  <div class='ow-strip'>{strip_html}</div>"
+            f"  <div class='ow-strip'>{''.join(cells)}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -342,7 +381,6 @@ def render_timeline_strips(
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-
 st.set_page_config(page_title="Flyfishing Weather Planner", layout="wide")
 st.title("Flyfishing Weather Planner")
 
@@ -354,7 +392,10 @@ with st.sidebar:
         options=list(PRESETS.keys()),
         index=list(PRESETS.keys()).index(DEFAULT_PRESET_NAME),
     )
-    lat, lon = PRESETS[preset_name]
+
+    location = PRESETS[preset_name]
+    lat, lon = location["lat"], location["lon"]
+    loc_type = location.get("type", "lake")
     user_agent = DEFAULT_USER_AGENT  # internal; not user-editable
 
     st.header("Fishing window")
@@ -370,9 +411,9 @@ if day_end < day_start:
     st.error("End time must be >= start time.")
     st.stop()
 
-# Fetch
+# Fetch NWS wind forecast
 try:
-    periods = fetch_hourly_periods(lat, lon, user_agent)
+    periods = fetch_nws_hourly_periods(lat, lon, user_agent)
 except Exception as e:
     st.error(f"Failed to fetch NWS data: {e}")
     st.stop()
@@ -395,3 +436,22 @@ if not day_hours:
     st.write("No hourly data fell within the selected fishing window.")
 else:
     render_timeline_strips(day_hours, day_start, day_end)
+
+# Optional: show USGS river flow only for river locations
+if loc_type == "river" and location.get("usgs_site"):
+    st.subheader("River flow (USGS)")
+
+    site = location["usgs_site"]
+    river_name = location.get("usgs_name", f"USGS site {site}")
+
+    cfs, when = usgs_latest_discharge_cfs(site)
+
+    col1, col2 = st.columns([2, 3])
+    with col1:
+        st.metric("Current discharge", "—" if cfs is None else f"{cfs:,.0f} CFS")
+    with col2:
+        st.write(river_name)
+        if when:
+            st.caption(f"Observed: {when}")
+        else:
+            st.caption("Observation time unavailable")
